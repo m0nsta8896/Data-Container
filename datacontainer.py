@@ -66,12 +66,6 @@ class Lazy:
 	def invalidate(self) -> None:
 		self._cache.clear()
 
-class FrozenDict(dict):
-	def __readonly(self, *a, **k):
-		raise TypeError("FrozenDict is immutable")
-
-	__setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __readonly
-
 class View:
 	def __init__(self, source: "Data", mapping: Dict[str, Callable[["Data"], Any]]):
 		self._source = source
@@ -95,6 +89,12 @@ class View:
 
 	def __repr__(self):
 		return f"<View {list(self._mapping)}>"
+
+class FrozenDict(dict):
+	def __readonly(self, *a, **k):
+		raise TypeError("FrozenDict is immutable")
+
+	__setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __readonly
 
 
 class Data:
@@ -375,4 +375,11 @@ class Data:
 			print("Hashing failed")
 			raise SerializationError(f"Hashing failed: {e}\n{tb}") from e
 
+__all__ = (
+	'Data',
+	
+	'View',
+	'Computed',
+	'Lazy'
+)
 __version__ = "2.0.0"
