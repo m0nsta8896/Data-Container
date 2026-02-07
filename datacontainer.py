@@ -35,7 +35,7 @@ class Computed:
 		if not callable(fn):
 			raise TypeError("Computed expects a callable")
 		self.fn = fn
-
+	
 	def compute(self, data: "Data", key: str = "<computed>") -> Any:
 		try:
 			return self.fn(data)
@@ -51,7 +51,7 @@ class Lazy:
 		self.fn = fn
 		# cache keyed by id(data) so same Lazy instance can be reused across Data
 		self._cache: Dict[int, Any] = {}
-
+	
 	def get(self, data: "Data", key: str = "<lazy>") -> Any:
 		did = id(data)
 		if did not in self._cache:
@@ -62,15 +62,21 @@ class Lazy:
 				print("Lazy evaluation failed for key %s", key)
 				raise ComputationError(key, e, tb) from e
 		return self._cache[did]
-
+	
 	def invalidate(self) -> None:
 		self._cache.clear()
+
+class FrozenDict(dict):
+	def __readonly(self, *a, **k):
+		raise TypeError("FrozenDict is immutable")
+	
+	__setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __readonly
 
 class View:
 	def __init__(self, source: "Data", mapping: Dict[str, Callable[["Data"], Any]]):
 		self._source = source
 		self._mapping = mapping
-
+	
 	def __getattr__(self, name: str) -> Any:
 		if name in self._mapping:
 			fn = self._mapping[name]
@@ -86,15 +92,19 @@ class View:
 				print("View computation failed for %s", name)
 				raise ComputationError(name, e, tb) from e
 		raise AttributeError(name)
-
+	
 	def __repr__(self):
 		return f"<View {list(self._mapping)}>"
 
-class FrozenDict(dict):
-	def __readonly(self, *a, **k):
-		raise TypeError("FrozenDict is immutable")
-
-	__setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __readonly
+class AntiFreeze:
+	def __init__(self, value: Any):
+		self.value = value
+	
+	def unwrap(self) -> Any:
+		return self.value
+	
+	def __repr__(self):
+		return f"AntiFreeze({self.value!r})"
 
 
 class Data:
@@ -103,31 +113,38 @@ class Data:
 		super().__setattr__("_Data__watchers", [])
 		super().__setattr__("_Data__lazy_fields", {})
 		super().__setattr__("_Data__transaction_stack", [])
+		super().__setattr__("_Data__anti_freeze_fields", set())
 		
 		# assign with validation
 		for k, v in kwargs.items():
 			if not isinstance(k, str) or not k.isidentifier():
-				print("Invalid key provided at init: %s", k)
 				raise DataError(f"Invalid key: {k!r} (must be a valid identifier)")
-			# allow Computed/Lazy to be assigned; they will be processed next
+			
+			# AntiFreeze marker (unwrap immediately)
+			if isinstance(v, AntiFreeze):
+				self.__anti_freeze_fields.add(k)
+				v = v.unwrap()
+			
 			super().__setattr__(k, v)
 		
 		# compute Computed and register Lazy
 		for k, v in list(self.__dict__.items()):
 			if isinstance(v, Computed):
-				try:
-					val = v.compute(self, key=k)
-					super().__setattr__(k, val)
-				except ComputationError:
-					# let caller handle; we've logged
-					raise
+				val = v.compute(self, key=k)
+				
+				# allow Computed to return AntiFreeze
+				if isinstance(val, AntiFreeze):
+					self.__anti_freeze_fields.add(k)
+					val = val.unwrap()
+				
+				super().__setattr__(k, val)
+			
 			elif isinstance(v, Lazy):
 				self.__lazy_fields[k] = v
-				# store placeholder so attribute access exists
 				super().__setattr__(k, None)
-
+	
 	# ---------------- core ----------------
-
+	
 	def freeze(self) -> "Data":
 		def _freeze(v):
 			if isinstance(v, Data):
@@ -143,18 +160,25 @@ class Data:
 		
 		if not self.__frozen:
 			for k, v in list(self.__dict__.items()):
-				if not k.startswith("_Data__"):
-					try:
-						super().__setattr__(k, _freeze(v))
-					except Exception as e:
-						tb = traceback.format_exc()
-						print("Failed to freeze key %s", k)
-						raise DataError(f"Error freezing key '{k}': {e}\n{tb}") from e
+				if k.startswith("_Data__"):
+					continue
+				if k in self.__anti_freeze_fields:
+					continue
+				
+				try:
+					super().__setattr__(k, _freeze(v))
+				except Exception as e:
+					tb = traceback.format_exc()
+					raise DataError(
+						f"Error freezing key '{k}': {e}\n{tb}"
+					) from e
+			
 			super().__setattr__("_Data__frozen", True)
+		
 		return self
-
+	
 	# ---------------- lazy ----------------
-
+	
 	def __getattribute__(self, name: str) -> Any:
 		# efficient small-path: only inspect lazy dict when it's present
 		d = object.__getattribute__(self, "__dict__")
@@ -170,16 +194,16 @@ class Data:
 				print("Unexpected lazy error for %s", name)
 				raise ComputationError(name, e, tb) from e
 		return object.__getattribute__(self, name)
-
+	
 	def _invalidate_lazy(self):
 		for lazy in self.__lazy_fields.values():
 			try:
 				lazy.invalidate()
 			except Exception:
 				print("Lazy.invalidate failed")
-
+	
 	# ---------------- observers ----------------
-
+	
 	def watch(self, fn: Callable[[str, Any, Any], None]) -> None:
 		if not callable(fn):
 			raise TypeError("watch() expects a callable")
@@ -192,40 +216,38 @@ class Data:
 			except Exception:
 				# watcher must not break core logic; log and continue
 				print("Watcher raised for key %s", key)
-
+	
 	# ---------------- setattr ----------------
-
+	
 	def __setattr__(self, key: str, value: Any) -> None:
-		if self.__frozen:
-			print("Attempt to modify frozen Data: %s=%r", key, value)
-			raise AttributeError("Data is frozen")
+		if self.__frozen and key not in self.__anti_freeze_fields:
+			raise AttributeError(f"Data is frozen (cannot modify '{key}')")
 		
 		if not isinstance(key, str) or not key.isidentifier():
-			print("Invalid attribute assignment: %r = %r", key, value)
 			raise DataError(f"Invalid attribute name: {key!r}")
 		
 		old = self.__dict__.get(key, None)
-		# set directly to avoid recursion through our __getattribute__
 		super().__setattr__(key, value)
-		# best-effort invalidation & notify; any exceptions are logged but do not leave object inconsistent
+		
 		try:
 			self._invalidate_lazy()
 		except Exception:
 			print("Failed to invalidate lazy fields after setting %s", key)
+		
 		try:
 			self._notify(key, old, value)
 		except Exception:
 			print("Failed to notify watchers after setting %s", key)
-
+	
 	# ---------------- views ----------------
-
+	
 	def view(self, mapping: Dict[str, Callable[["Data"], Any]]) -> View:
 		if not isinstance(mapping, dict):
 			raise TypeError("view() mapping must be a dict")
 		return View(self, mapping)
-
+	
 	# ---------------- path access ----------------
-
+	
 	def get(self, path: str, default: Any = None) -> Any:
 		if not isinstance(path, str) or path == "":
 			raise PathError("path must be a non-empty string")
@@ -240,7 +262,7 @@ class Data:
 				# cannot traverse further
 				return default
 		return cur
-
+	
 	def set(self, path: str, value: Any) -> None:
 		if not isinstance(path, str) or path == "":
 			raise PathError("path must be a non-empty string")
@@ -264,9 +286,9 @@ class Data:
 			cur[parts[-1]] = value
 		else:
 			raise PathError(f"Cannot set path {path!r} (parent is {type(cur).__name__})")
-
+	
 	# ---------------- diff / patch ----------------
-
+	
 	def diff(self, other: "Data") -> Dict[str, Tuple[Any, Any]]:
 		if not isinstance(other, Data):
 			raise TypeError("diff() expects another Data instance")
@@ -280,7 +302,7 @@ class Data:
 			if a != b:
 				out[k] = (b, a)
 		return out
-
+	
 	def apply(self, patch: Dict[str, Tuple[Any, Any]]) -> None:
 		if not isinstance(patch, dict):
 			raise TypeError("apply() expects a dict patch")
@@ -290,9 +312,9 @@ class Data:
 			except Exception:
 				raise DataError(f"Invalid patch entry for key {k!r}: {pair!r}")
 			setattr(self, k, new)
-
+	
 	# ---------------- transactions ----------------
-
+	
 	@contextmanager
 	def transaction(self):
 		try:
@@ -320,9 +342,9 @@ class Data:
 				raise TransactionError(f"Rollback failed: {inner}\n{tb}") from inner
 			# re-raise original error for caller to handle
 			raise
-
+	
 	# ---------------- snapshot ----------------
-
+	
 	def snapshot(self) -> "Data":
 		try:
 			return copy.deepcopy(self)
@@ -330,9 +352,9 @@ class Data:
 			tb = traceback.format_exc()
 			print("Snapshot failed")
 			raise DataError(f"Snapshot failed: {e}\n{tb}") from e
-
+	
 	# ---------------- serialization ----------------
-
+	
 	def to_dict(self, _memo: Optional[Set[int]] = None) -> dict:
 		try:
 			if _memo is None:
@@ -347,8 +369,16 @@ class Data:
 					continue
 				if isinstance(v, Data):
 					out[k] = v.to_dict(_memo)
+				elif isinstance(v, dict):
+					out[k] = {
+						kk: vv.to_dict(_memo) if isinstance(vv, Data) else vv
+						for kk, vv in v.items()
+					}
 				elif isinstance(v, (list, tuple, set)):
-					out[k] = [i.to_dict(_memo) if isinstance(i, Data) else i for i in v]
+					out[k] = [
+						i.to_dict(_memo) if isinstance(i, Data) else i
+						for i in v
+					]
 				else:
 					out[k] = v
 			return out
@@ -356,15 +386,15 @@ class Data:
 			tb = traceback.format_exc()
 			print("Serialization failed")
 			raise SerializationError(f"to_dict failed: {e}\n{tb}") from e
-
+	
 	# ---------------- dunder ----------------
-
+	
 	def __repr__(self):
 		try:
 			return f"Data({self.to_dict()})"
 		except SerializationError:
 			return f"<Data (unserializable) at {hex(id(self))}>"
-
+	
 	def __hash__(self):
 		if not self.__frozen:
 			raise TypeError("Unfrozen Data is unhashable")
@@ -379,7 +409,9 @@ __all__ = (
 	'Data',
 	
 	'View',
+	'AntiFreeze',
+	
 	'Computed',
 	'Lazy'
 )
-__version__ = "2.0.0"
+__version__ = "2.1.0"

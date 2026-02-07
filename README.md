@@ -247,7 +247,43 @@ hash(d)
 
 * Frozen Data is immutable
 * Frozen Data is hashable
-* Freezing recursively freezes nested structures
+* Freezing recursively freezes nested structures (dict → FrozenDict, list → tuple, etc.)
+
+**AntiFreeze (Selective Mutability)**
+
+In some cases, full immutability is undesirable.
+
+Examples:
+
+* caches
+* runtime handles
+* file descriptors
+* live connections
+* internal counters
+
+For these cases, AntiFreeze allows explicit opt-out from freezing.
+
+```python
+from datacontainer import Data, AntiFreeze
+
+d = Data(
+	config=Data(mode="prod"),
+	cache=AntiFreeze({})
+)
+
+d.freeze()
+
+d.cache["x"] = 42        # allowed
+d.config.mode = "dev"    # raises AttributeError
+```
+
+Key properties:
+
+* Only fields explicitly wrapped in AntiFreeze remain mutable
+* All other fields remain deeply frozen
+* AntiFreeze must be declared at initialization or computation time
+* AntiFreeze is removed after unwrap (it does not exist at runtime)
+* This preserves immutability guarantees without sacrificing practicality.
 
 ---
 
