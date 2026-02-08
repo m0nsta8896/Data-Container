@@ -1,326 +1,277 @@
 # Data Container
 
-A **reactive, transactional, diffable, lazy, serializable state container** for Python.
-
-This project provides a single core class (`Data`) that can act as:
-
-* A dynamic attribute-based data container
-* A reactive state engine with watchers
-* A lazy / computed value system
-* A transactional state store (with rollback)
-* A diff / patch engine
-* A snapshot & freezeable value object
-* A JSON-serializable structure with circular reference safety
-
-This is **not** a dataclass replacement, ORM, or schema-first validator. It is designed for **runtime state**, **configuration**, and **application logic glue**.
+A reactive, transactional, and serializable state container for Python.
+DataContainer is a single-file, zero-dependency library designed for scenarios where you need more than a dict but less than a database. It bridges the gap between static data structures (like dataclasses) and dynamic runtime state.
+It provides a dictionary-like object that supports computed values, lazy loading, change observers, atomic transactions, and deep immutability.
 
 ---
 
-## Table of Contents
+## Quick Start
 
-* [Why this exists](#why-this-exists)
-* [Installation](#installation)
-* [Quick Example](#quick-example)
-* [Core Concepts](#core-concepts)
-
-  * [Basic Data Usage](#basic-data-usage)
-  * [Computed Fields](#computed-fields)
-  * [Lazy Fields](#lazy-fields)
-  * [Views](#views)
-  * [Watchers (Change Tracking)](#watchers-change-tracking)
-  * [Path-Based Access](#path-based-access)
-  * [Diff & Patch](#diff--patch)
-  * [Transactions](#transactions)
-  * [Snapshots](#snapshots)
-  * [Freezing & Hashing](#freezing--hashing)
-  * [Serialization](#serialization)
-* [Error Handling Model](#error-handling-model)
-* [Design Philosophy](#design-philosophy)
-* [Weaknesses & Tradeoffs](#weaknesses--tradeoffs)
-* [When You SHOULD Use This](#when-you-should-use-this)
-* [When You SHOULD NOT Use This](#when-you-should-not-use-this)
-* [FAQ](#faq)
-
----
-
-## Why this exists
-
-Python has excellent tools for **static data** (`dataclasses`, `attrs`, `pydantic`).
-
-But many applications need **dynamic, evolving state**:
-
-* Bots
-* Long-running services
-* Configuration systems
-* UI / game state
-* Hot-reloadable settings
-* Derived runtime values
-
-This project focuses on **runtime behavior**, not schemas.
-
----
-
-## Installation
-
-Copy `datacontainer.py` into your project, or vendor it as a module.
-
-There are **no third-party dependencies**.
-
----
-
-## Quick Example
+Copy `datacontainer.py` into your project. That's it.
 
 ```python
 from datacontainer import Data, Computed, Lazy
 
-state = Data(
-	x=10,
-	y=Computed(lambda s: s.x + 5),
-	z=Lazy(lambda s: s.x * 2)
+# Define state with logic attached
+config = Data(
+    host="localhost",
+    port=8080,
+    # Computed: Updates automatically when dependencies change
+    url=Computed(lambda s: f"http://{s.host}:{s.port}"),
+    # Lazy: Only runs once, when accessed
+    db_connection=Lazy(lambda s: connect_db(s.host))
 )
 
-print(state.y)  # 15
-print(state.z)  # 20
+print(config.url)  # http://localhost:8080
 
-state.x = 7
-print(state.z)  # 14 (lazy invalidated automatically)
+config.port = 9000
+print(config.url)  # http://localhost:9000 (Auto-updated)
 ```
 
 ---
 
-## Core Concepts
-
-### Basic Data Usage
-
-```python
-d = Data(a=1, b=2)
-
-d.a = 5
-print(d["a"])  # 5
-```
-
-* Attributes and dict-style access both work
-* Only valid Python identifiers are allowed as keys
+## Table of Contents
+ * [Core Features](#core-features)
+ * [Reactivity & Logic](#reactivity--logic)
+   * [Computed Fields](#computed-fields)
+   * [Lazy Fields](#lazy-fields)
+   * [Attached Methods](#attached-methods)
+   * [Watchers](#watchers)
+ * [State Management](#state-management)
+   * [Path Access](#path-access)
+   * [Transactions & Rollbacks](#transactions--rollbacks)
+   * [Diffing & Patching](#diffing--patching)
+ * [Immutability & Safety](#immutability--safety)
+   * [Freezing](#freezing)
+   * [AntiFreeze (Selective Mutability)](#antifreeze-selective-mutability)
+ * [Serialization](#serialization)
+ * [Design Philosophy](#design-philosophy)
+ * [Weaknesses & Tradeoffs](#weaknesses--tradeoffs)
+   * [Performance](#performance)
+   * [Thread Safety](#thread-safety)
+   * [Memory Usage](#memory-usage)
+   * [Schema Validation](#schema-validation)
+ * [When You SHOULD Use This](#when-you-should-use-this)
+ * [When You SHOULD NOT Use This](#when-you-should-not-use-this)
+ * [FAQ](#faq)
 
 ---
+
+## Core Features
+
+Feature       | Description                                                       |
+:------------ | :---------------------------------------------------------------- |
+Dynamic       | Add or remove fields at runtime like a dictionary.                |
+Reactive      | Fields that recalculate based on other fields.                    |
+Lazy          | Expensive calculations run only when needed and cache the result. |
+Transactional | Make changes in a with block; if it fails, state rolls back.      |
+Observable    | Listen for changes on specific keys.                              |
+Diffable      | Compare two state objects and generate a patch.                   |
+Safe          | Handles circular references in serialization automatically.       |
+
+---
+
+## Reactivity & Logic
 
 ### Computed Fields
 
-Computed fields are evaluated **once at initialization**.
+Computed fields are calculated immediately upon initialization. While they don't dynamically update stored values, they are useful for initial derivation.
+(Note: For live updates, use Views or simply access the computed property again if it depends on mutable state).
 
 ```python
-d = Data(
-	x=10,
-	y=Computed(lambda s: s.x * 3)
+cart = Data(
+    price=100,
+    tax_rate=0.2,
+    total=Computed(lambda s: s.price * (1 + s.tax_rate))
 )
 
-print(d.y)  # 30
+print(cart.total) # 120.0
 ```
-
-If computation fails, a `ComputationError` is raised with full traceback context.
-
----
 
 ### Lazy Fields
 
-Lazy fields are evaluated **on first access** and cached.
+Lazy fields are perfect for expensive operations (loading files, connecting to APIs). The result is cached indefinitely until the Data object is modified.
+Automatic Cache Invalidation: If any attribute on the Data object changes, the lazy cache is cleared to ensure consistency.
 
 ```python
-d = Data(
-	x=5,
-	y=Lazy(lambda s: expensive_operation(s.x))
+app = Data(
+    theme="dark",
+    # This won't run until you ask for it
+    assets=Lazy(lambda s: load_heavy_assets(s.theme))
 )
 
-print(d.y)  # computed now
-print(d.y)  # cached
+x = app.assets # Loads assets...
+y = app.assets # Instant (cached)
+
+app.theme = "light" # Invalidates cache
+z = app.assets # Reloads assets for light theme
 ```
 
-Any mutation of the Data object automatically invalidates all lazy caches.
+### Attached Methods
+
+You can bind functions to the `Data` object, effectively giving it "methods" without defining a class.
+from datacontainer import Data, Method
+
+```python
+def greet_user(data, time_of_day):
+    return f"Good {time_of_day}, {data.name}!"
+
+user = Data(
+    name="Alice",
+    greet=Method(greet_user)
+)
+
+print(user.greet("morning")) # "Good morning, Alice!"
+```
+
+### Watchers (Observers)
+
+Trigger side effects when data changes.
+
+```python
+def log_change(key, old_val, new_val):
+    print(f"[AUDIT] {key} changed from {old_val} to {new_val}")
+
+settings = Data(volume=50)
+settings.watch(log_change)
+
+settings.volume = 75 
+# Output: [AUDIT] volume changed from 50 to 75
+```
 
 ---
 
-### Views
+## State Management
 
-Views are **live projections** of a Data object.
+### Path Access
+
+Access nested data deeply without worrying about AttributeError or KeyError.
 
 ```python
-user = Data(first="Ada", last="Lovelace")
+config = Data(
+    server=Data(
+        logging=Data(level="INFO")
+    )
+)
 
-view = user.view({
-	"full": lambda u: f"{u.first} {u.last}",
-	"initials": lambda u: u.first[0] + u.last[0]
-})
+# Dot notation for deeply nested sets
+config.set("server.logging.level", "DEBUG")
 
-print(view.full)
+# Safe gets
+level = config.get("server.logging.level") 
+missing = config.get("server.database.host", "127.0.0.1") # Default value
 ```
 
-Views:
+### Transactions & Rollbacks
 
-* Do not store data
-* Always reflect the current state
-* Are read-only
-
----
-
-### Watchers (Change Tracking)
-
-Watchers observe mutations.
+Perform atomic updates. If an error occurs within the block, the state reverts to exactly how it was before the block started.
 
 ```python
-def on_change(key, old, new):
-	print(key, old, "→", new)
+state = Data(credits=100, items=[])
 
-state.watch(on_change)
-state.x = 42
-```
-
-Watcher errors are logged but **do not interrupt state mutation**.
-
----
-
-### Path-Based Access
-
-```python
-d = Data()
-d.set("a.b.c", 10)
-
-print(d.get("a.b.c"))  # 10
-```
-
-This is useful for nested configuration and dynamic structures.
-
----
-
-### Diff & Patch
-
-```python
-a = Data(x=1, y=2)
-b = Data(x=1, y=3, z=4)
-
-patch = b.diff(a)
-# { 'y': (2, 3), 'z': (None, 4) }
-
-a.apply(patch)
-```
-
-This enables syncing, undo/redo, and replication.
-
----
-
-### Transactions
-
-Transactions provide **atomic mutations**.
-
-```python
 try:
-	with d.transaction():
-		d.x = 100
-		raise RuntimeError()
+    with state.transaction():
+        state.credits -= 50
+        state.items.append("Sword")
+        
+        # Simulate a crash
+        raise RuntimeError("Database disconnected!")
 except RuntimeError:
-	pass
+    print("Transaction failed, rolling back...")
 
-print(d.x)  # original value restored
+print(state.credits) # 100 (Safe!)
+print(state.items)   # []
 ```
 
-If rollback fails, a `TransactionError` is raised.
+### Diffing & Patching
+
+Useful for networking (sending only changes) or undo/redo systems.
+
+```python
+state_v1 = Data(x=10, y=20)
+state_v2 = Data(x=10, y=99)
+
+# Calculate difference
+diff = state_v2.diff(state_v1) 
+# Result: {'y': (20, 99)}  (Key: (Old, New))
+
+# Apply patch to bring v1 up to date
+state_v1.apply(diff)
+assert state_v1.y == 99
+```
 
 ---
 
-### Snapshots
+## Immutability & Safety
+
+### Freezing
+
+Turn your Data object into a read-only, hashable structure. This is recursive: lists become tuples, sets become frozensets, and dicts become FrozenDicts.
 
 ```python
-snap = d.snapshot()
-d.x = 5
-print(snap.x)  # unchanged
+config = Data(host="localhost", ports=[80, 443])
+config.freeze()
+
+# config.host = "1.1.1.1"    # Raises AttributeError
+# config.ports.append(8080)  # Raises TypeError (it's now a tuple)
+
+# Now it can be used as a dictionary key
+cache = {config: "Server Status OK"}
 ```
 
-Snapshots are deep copies and completely isolated.
+### AntiFreeze (Selective Mutability)
 
----
-
-### Freezing & Hashing
-
-```python
-d.freeze()
-hash(d)
-```
-
-* Frozen Data is immutable
-* Frozen Data is hashable
-* Freezing recursively freezes nested structures (dict → FrozenDict, list → tuple, etc.)
-
-**AntiFreeze (Selective Mutability)**
-
-In some cases, full immutability is undesirable.
-
-Examples:
-
-* caches
-* runtime handles
-* file descriptors
-* live connections
-* internal counters
-
-For these cases, AntiFreeze allows explicit opt-out from freezing.
+Sometimes you need an object to be hashable/frozen, but still keep a specific field mutable (like a cache, a counter, or a network socket).
 
 ```python
 from datacontainer import Data, AntiFreeze
 
-d = Data(
-	config=Data(mode="prod"),
-	cache=AntiFreeze({})
+server = Data(
+    id="srv-01",
+    # This field remains mutable even after freezing
+    metrics=AntiFreeze({"uptime": 0})
 )
 
-d.freeze()
+server.freeze()
 
-d.cache["x"] = 42        # allowed
-d.config.mode = "dev"    # raises AttributeError
+# Identity is stable
+print(hash(server)) 
+
+# You can still modify the AntiFreeze field
+server.metrics["uptime"] = 100 
 ```
-
-Key properties:
-
-* Only fields explicitly wrapped in AntiFreeze remain mutable
-* All other fields remain deeply frozen
-* AntiFreeze must be declared at initialization or computation time
-* AntiFreeze is removed after unwrap (it does not exist at runtime)
-* This preserves immutability guarantees without sacrificing practicality.
 
 ---
 
-### Serialization
+## Serialization
+
+Convert to a dictionary safely. DataContainer automatically detects circular references to prevent infinite recursion errors.
 
 ```python
-print(d.to_dict())
+parent = Data(name="Parent")
+child = Data(name="Child", parent=parent)
+parent.child = child
+
+# Standard JSON dump would crash here
+data_dict = parent.to_dict()
+
+# Result: 
+# {
+#   "name": "Parent", 
+#   "child": {
+#     "name": "Child", 
+#     "parent": {"$circular": True}
+#   }
+# }
 ```
-
-* Circular references are handled safely
-* Non-serializable errors raise `SerializationError`
-
----
-
-## Error Handling Model
-
-This library uses **explicit, structured errors**:
-
-* `DataError` – base class
-* `ComputationError` – computed / lazy / view failures
-* `TransactionError` – rollback failures
-* `PathError` – invalid path access
-* `SerializationError` – serialization or hashing failures
-
-All errors include contextual messages and captured tracebacks.
 
 ---
 
 ## Design Philosophy
-
-* Explicit over magical
-* Runtime behavior over static schemas
-* Safety over silent failure
-* Debuggability over raw performance
-* Single-file vendorable code
-
-This is intentionally **not** a framework.
+ * Runtime over Schema: No type hints required. Data evolves as the program runs.
+ * Explicit Errors: Custom exception types (`ComputationError`, `TransactionError`) make debugging easier.
+ * Vendorable: It is a single file. You should feel comfortable copying it directly into your project to avoid dependency hell.
 
 ---
 
