@@ -1,8 +1,9 @@
 import json
 import copy
 import traceback
+import weakref
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, Generator
 
 
 class DataError(Exception):
@@ -30,6 +31,21 @@ class SerializationError(DataError):
 	pass
 
 
+class Method:
+	def __init__(self, fn: Callable[..., Any]):
+		if not callable(fn):
+			raise TypeError("Method expects a callable")
+		self.fn = fn
+	
+	def bind(self, data: "Data", name: str) -> Callable:
+		def bound(*args, **kwargs):
+			try:
+				return self.fn(data, *args, **kwargs)
+			except Exception as e:
+				tb = traceback.format_exc()
+				raise ComputationError(name, e, tb) from e
+		return bound
+
 class Computed:
 	def __init__(self, fn: Callable[["Data"], Any]):
 		if not callable(fn):
@@ -41,7 +57,7 @@ class Computed:
 			return self.fn(data)
 		except Exception as e:
 			tb = traceback.format_exc()
-			print("Computed failed for key %s", key)
+			print(f"Computed failed for key {key}")
 			raise ComputationError(key, e, tb) from e
 
 class Lazy:
@@ -49,28 +65,22 @@ class Lazy:
 		if not callable(fn):
 			raise TypeError("Lazy expects a callable")
 		self.fn = fn
-		# cache keyed by id(data) so same Lazy instance can be reused across Data
-		self._cache: Dict[int, Any] = {}
+		self._cache = weakref.WeakKeyDictionary()
 	
 	def get(self, data: "Data", key: str = "<lazy>") -> Any:
-		did = id(data)
-		if did not in self._cache:
+		if data not in self._cache:
 			try:
-				self._cache[did] = self.fn(data)
+				self._cache[data] = self.fn(data)
 			except Exception as e:
 				tb = traceback.format_exc()
-				print("Lazy evaluation failed for key %s", key)
 				raise ComputationError(key, e, tb) from e
-		return self._cache[did]
+		return self._cache[data]
 	
-	def invalidate(self) -> None:
-		self._cache.clear()
-
-class FrozenDict(dict):
-	def __readonly(self, *a, **k):
-		raise TypeError("FrozenDict is immutable")
-	
-	__setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __readonly
+	def invalidate(self, data=None) -> None:
+		if data is None:
+			self._cache.clear()
+		else:
+			self._cache.pop(data, None)
 
 class View:
 	def __init__(self, source: "Data", mapping: Dict[str, Callable[["Data"], Any]]):
@@ -89,12 +99,13 @@ class View:
 				raise
 			except Exception as e:
 				tb = traceback.format_exc()
-				print("View computation failed for %s", name)
+				print(f"View computation failed for {name}")
 				raise ComputationError(name, e, tb) from e
 		raise AttributeError(name)
 	
-	def __repr__(self):
+	def __repr__(self) -> str:
 		return f"<View {list(self._mapping)}>"
+
 
 class AntiFreeze:
 	def __init__(self, value: Any):
@@ -103,17 +114,26 @@ class AntiFreeze:
 	def unwrap(self) -> Any:
 		return self.value
 	
-	def __repr__(self):
+	def __repr__(self) -> str:
 		return f"AntiFreeze({self.value!r})"
+
+class FrozenDict(dict):
+	def __readonly(self, *a, **k) -> None:
+		raise TypeError("FrozenDict is immutable")
+	
+	__setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __readonly
 
 
 class Data:
+	__slots__ = ('__dict__', '__weakref__')
+	
 	def __init__(self, **kwargs: Any):
 		super().__setattr__("_Data__frozen", False)
 		super().__setattr__("_Data__watchers", [])
 		super().__setattr__("_Data__lazy_fields", {})
 		super().__setattr__("_Data__transaction_stack", [])
 		super().__setattr__("_Data__anti_freeze_fields", set())
+		super().__setattr__("_Data__methods", {})
 		
 		# assign with validation
 		for k, v in kwargs.items():
@@ -127,9 +147,13 @@ class Data:
 			
 			super().__setattr__(k, v)
 		
-		# compute Computed and register Lazy
+		# compute Computed, register Lazy and Method
 		for k, v in list(self.__dict__.items()):
-			if isinstance(v, Computed):
+			if isinstance(v, Method):
+				self.__methods[k] = v
+				super().__setattr__(k, None)
+			
+			elif isinstance(v, Computed):
 				val = v.compute(self, key=k)
 				
 				# allow Computed to return AntiFreeze
@@ -173,6 +197,7 @@ class Data:
 						f"Error freezing key '{k}': {e}\n{tb}"
 					) from e
 			
+			super().__setattr__("_Data__hash", None)
 			super().__setattr__("_Data__frozen", True)
 		
 		return self
@@ -180,22 +205,25 @@ class Data:
 	# ---------------- lazy ----------------
 	
 	def __getattribute__(self, name: str) -> Any:
-		# efficient small-path: only inspect lazy dict when it's present
 		d = object.__getattribute__(self, "__dict__")
+		
+		methods = d.get("_Data__methods", {})
+		if name in methods:
+			return methods[name].bind(self, name)
+		
 		lazy = d.get("_Data__lazy_fields", {})
 		if name in lazy:
 			try:
 				return lazy[name].get(self, key=name)
 			except ComputationError:
-				# bubbled up intentionally
 				raise
 			except Exception as e:
 				tb = traceback.format_exc()
-				print("Unexpected lazy error for %s", name)
 				raise ComputationError(name, e, tb) from e
+		
 		return object.__getattribute__(self, name)
 	
-	def _invalidate_lazy(self):
+	def _invalidate_lazy(self) -> None:
 		for lazy in self.__lazy_fields.values():
 			try:
 				lazy.invalidate()
@@ -209,13 +237,13 @@ class Data:
 			raise TypeError("watch() expects a callable")
 		self.__watchers.append(fn)
 
-	def _notify(self, key: str, old: Any, new: Any):
+	def _notify(self, key: str, old: Any, new: Any) -> None:
 		for w in list(self.__watchers):
 			try:
 				w(key, old, new)
 			except Exception:
 				# watcher must not break core logic; log and continue
-				print("Watcher raised for key %s", key)
+				print(f"Watcher raised for key {key}")
 	
 	# ---------------- setattr ----------------
 	
@@ -226,18 +254,21 @@ class Data:
 		if not isinstance(key, str) or not key.isidentifier():
 			raise DataError(f"Invalid attribute name: {key!r}")
 		
+		if not self.__frozen:
+			super().__setattr__("_Data__hash", None)
+		
 		old = self.__dict__.get(key, None)
 		super().__setattr__(key, value)
 		
 		try:
 			self._invalidate_lazy()
 		except Exception:
-			print("Failed to invalidate lazy fields after setting %s", key)
+			print(f"Failed to invalidate lazy fields after setting {key}")
 		
 		try:
 			self._notify(key, old, value)
 		except Exception:
-			print("Failed to notify watchers after setting %s", key)
+			print(f"Failed to notify watchers after setting {key}")
 	
 	# ---------------- views ----------------
 	
@@ -316,9 +347,13 @@ class Data:
 	# ---------------- transactions ----------------
 	
 	@contextmanager
-	def transaction(self):
+	def transaction(self) -> Generator[None, None, None]:
 		try:
-			snapshot = copy.deepcopy(self.__dict__)
+			snapshot = {
+				k: copy.deepcopy(v)
+				for k, v in self.__dict__.items()
+				if not k.startswith("_Data__")
+			}
 		except Exception as e:
 			tb = traceback.format_exc()
 			print("Failed to snapshot state for transaction")
@@ -333,9 +368,15 @@ class Data:
 			# rollback
 			try:
 				state = self.__transaction_stack.pop()
-				self.__dict__.clear()
-				self.__dict__.update(state)
-				print("Transaction failed and was rolled back due to: %s", e)
+				
+				for k in list(self.__dict__.keys()):
+					if not k.startswith("_Data__"):
+						del self.__dict__[k]
+				for k, v in state.items():
+					if not k.startswith("_Data__"):
+						self.__dict__[k] = v
+				
+				print(f"Transaction failed and was rolled back due to: {e}")
 			except Exception as inner:
 				tb = traceback.format_exc()
 				print("Rollback failed")
@@ -355,7 +396,7 @@ class Data:
 	
 	# ---------------- serialization ----------------
 	
-	def to_dict(self, _memo: Optional[Set[int]] = None) -> dict:
+	def to_dict(self, _memo: Optional[Set[int]] = None, *, for_hash: bool = False) -> Dict[str, Any]:
 		try:
 			if _memo is None:
 				_memo = set()
@@ -367,51 +408,84 @@ class Data:
 			for k, v in self.__dict__.items():
 				if k.startswith("_Data__"):
 					continue
+				if for_hash:
+					if k in self.__anti_freeze_fields:
+						continue
+					if k in self.__lazy_fields:
+						continue
+				
 				if isinstance(v, Data):
-					out[k] = v.to_dict(_memo)
+					out[k] = v.to_dict(_memo, for_hash=for_hash)
 				elif isinstance(v, dict):
 					out[k] = {
-						kk: vv.to_dict(_memo) if isinstance(vv, Data) else vv
+						kk: vv.to_dict(_memo, for_hash=for_hash)
+						if isinstance(vv, Data) else vv
 						for kk, vv in v.items()
 					}
 				elif isinstance(v, (list, tuple, set)):
 					out[k] = [
-						i.to_dict(_memo) if isinstance(i, Data) else i
+						i.to_dict(_memo, for_hash=for_hash)
+						if isinstance(i, Data) else i
 						for i in v
 					]
 				else:
 					out[k] = v
+			
 			return out
 		except Exception as e:
 			tb = traceback.format_exc()
-			print("Serialization failed")
 			raise SerializationError(f"to_dict failed: {e}\n{tb}") from e
 	
 	# ---------------- dunder ----------------
 	
-	def __repr__(self):
+	def __repr__(self) -> str:
 		try:
 			return f"Data({self.to_dict()})"
 		except SerializationError:
 			return f"<Data (unserializable) at {hex(id(self))}>"
 	
-	def __hash__(self):
+	def __eq__(self, other: object) -> bool:
+		if self is other:
+			return True
+		
+		if not isinstance(other, Data):
+			return NotImplemented
+		
+		if not self.__frozen or not other.__frozen:
+			return False
+		
+		try:
+			return self.to_dict(for_hash=True) == other.to_dict(for_hash=True)
+		except Exception:
+			return False
+	
+	def __hash__(self) -> int:
 		if not self.__frozen:
 			raise TypeError("Unfrozen Data is unhashable")
+		
+		h = getattr(self, "_Data__hash", None)
+		if h is not None:
+			return h
+		
 		try:
-			return hash(json.dumps(self.to_dict(), sort_keys=True))
+			h = hash(json.dumps(
+				self.to_dict(for_hash=True),
+				sort_keys=True
+			))
+			super().__setattr__("_Data__hash", h)
+			return h
 		except Exception as e:
 			tb = traceback.format_exc()
-			print("Hashing failed")
 			raise SerializationError(f"Hashing failed: {e}\n{tb}") from e
 
 __all__ = (
 	'Data',
 	
-	'View',
 	'AntiFreeze',
 	
+	'Method',
 	'Computed',
-	'Lazy'
+	'Lazy',
+	'View'
 )
 __version__ = "2.1.0"
