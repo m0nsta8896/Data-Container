@@ -111,9 +111,10 @@ z = app.assets # Reloads assets for light theme
 ### Attached Methods
 
 You can bind functions to the `Data` object, effectively giving it "methods" without defining a class.
-from datacontainer import Data, Method
 
 ```python
+from datacontainer import Data, Method
+
 def greet_user(data, time_of_day):
     return f"Good {time_of_day}, {data.name}!"
 
