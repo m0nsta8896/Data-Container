@@ -37,6 +37,7 @@ print(config.url)  # http://localhost:9000 (Auto-updated)
    * [Computed Fields](#computed-fields)
    * [Lazy Fields](#lazy-fields)
    * [Attached Methods](#attached-methods)
+   * [Decorators](#decorators)
    * [Watchers](#watchers)
  * [State Management](#state-management)
    * [Path Access](#path-access)
@@ -124,6 +125,36 @@ user = Data(
 )
 
 print(user.greet("morning")) # "Good morning, Alice!"
+```
+
+### Decorators
+
+If you prefer defining logic outside the constructor, or need to attach logic to an instance after it is created, you can use decorators.
+
+```python
+player = Data(
+    name="Hero", 
+    stats=Data(str=10, dex=15)
+)
+
+# Computed: Registered immediately
+@player.computed
+def combat_rating(self):
+    return self.stats.str + self.stats.dex
+
+# Lazy: Registered, but runs on first access
+@player.lazy
+def inventory(self):
+    print("Fetching inventory from DB...")
+    return ["Sword", "Shield"]
+
+# Method: Bound to the instance
+@player.method
+def attack(self, target):
+    return f"{self.name} hits {target} for {self.combat_rating} damage!"
+
+print(player.combat_rating)      # 25
+print(player.attack("Slime"))    # "Hero hits Slime for 25 damage!"
 ```
 
 ### Watchers (Observers)

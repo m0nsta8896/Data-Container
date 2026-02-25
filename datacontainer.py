@@ -413,7 +413,96 @@ class Data:
 		else:
 			raise PathError(f"Cannot set path {path!r} (parent is {type(cur).__name__})")
 	
-	# 2. State Control
+	# 2. Decorators
+	
+	def method(self, fn: Callable[..., Any]) -> Callable[..., Any]:
+		"""
+		Decorator to register a function as a Method on this Data instance.
+		
+		Usage:
+			@data.method
+			def foo(self, ...):
+				...
+		"""
+		if not callable(fn):
+			raise TypeError("Data.method expects a callable")
+		if self.__frozen:
+			raise AttributeError("Cannot add methods to frozen Data")
+		
+		name = fn.__name__
+		
+		if hasattr(type(self), name):
+			raise AttributeError(f"Cannot add method '{name}': name is reserved by Data")
+		
+		self._Data__methods[name] = Method(fn)
+		
+		if name in self.__dict__:
+			del self.__dict__[name]
+		
+		return fn
+	
+	def computed(self, fn: Callable[["Data"], Any]) -> Any:
+		"""
+		Decorator to register and immediately compute a Computed field on this Data instance.
+		
+		Usage:
+			@data.computed
+			def foo(self):
+				...
+		"""
+		if not callable(fn):
+			raise TypeError("Data.computed expects a callable")
+		if self.__frozen:
+			raise AttributeError("Cannot add computed fields to frozen Data")
+		
+		name = fn.__name__
+		
+		if hasattr(type(self), name):
+			raise AttributeError(f"Cannot add computed '{name}': name is reserved by Data")
+		
+		comp = Computed(fn)
+		
+		try:
+			val = comp.compute(self, key=name)
+		except Exception:
+			raise
+		
+		if isinstance(val, AntiFreeze):
+			self.__anti_freeze_fields.add(name)
+			val = val.unwrap()
+		
+		super().__setattr__(name, val)
+		
+		return val
+	
+	def lazy(self, fn: Callable[["Data"], Any]) -> Lazy:
+		"""
+		Decorator to register a Lazy field on this Data instance.
+		
+		Usage:
+			@data.lazy
+			def foo(self):
+				...
+		"""
+		if not callable(fn):
+			raise TypeError("Data.lazy expects a callable")
+		if self.__frozen:
+			raise AttributeError("Cannot add lazy fields to frozen Data")
+		
+		name = fn.__name__
+		
+		if hasattr(type(self), name):
+			raise AttributeError(f"Cannot add lazy '{name}': name is reserved by Data")
+		
+		lz = Lazy(fn)
+		self.__lazy_fields[name] = lz
+		
+		if name in self.__dict__:
+			del self.__dict__[name]
+		
+		return lz
+	
+	# 3. State Control
 	
 	def freeze(self) -> "Data":
 		"""
@@ -504,7 +593,7 @@ class Data:
 			# re-raise original error for caller to handle
 			raise
 	
-	# 3. Observation & Sync
+	# 4. Observation & Sync
 	
 	def watch(self, fn: Callable[[str, Any, Any], None]) -> None:
 		"""
@@ -565,7 +654,7 @@ class Data:
 				raise DataError(f"Invalid patch entry for key {k!r}: {pair!r}")
 			setattr(self, k, new)
 	
-	# 4. Utilities & Dunders
+	# 5. Utilities & Dunders
 	
 	def to_dict(self, _memo: Optional[Set[int]] = None, *, for_hash: bool = False) -> Dict[str, Any]:
 		"""
@@ -688,4 +777,4 @@ class Data:
 			return f"<Data (unserializable) at {hex(id(self))}>"
 
 __all__ = ('Data', 'FrozenDict', 'AntiFreeze', 'Method', 'Computed', 'Lazy', 'View')
-__version__ = "2.1.0"
+__version__ = "2.2.0"
